@@ -1,0 +1,423 @@
+import streamlit as st
+import plotly.express as px
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+import pandas as pd
+from analytics import BreweryAnalytics
+
+st.set_page_config(page_title="Brewery Business Analytics Dashboard", layout="wide")
+st.title("Brewery Sales & Production Analytics Dashboard")
+
+
+def centered_dataframe(data, formats=None):
+    styler = data.style.set_properties(**{"text-align": "center"})
+    styler = styler.set_table_styles([
+        {"selector": "th", "props": [("text-align", "center")]},
+        {"selector": "td", "props": [("text-align", "center")]}
+    ])
+    if formats:
+        styler = styler.format(formats)
+    return styler
+
+
+def safe_column(df, column):
+    value = df[column]
+    if isinstance(value, pd.DataFrame):
+        return value.bfill(axis=1).iloc[:, 0]
+    return value
+
+
+def numeric_axis_range(values):
+    values = pd.to_numeric(values, errors="coerce").dropna()
+    if values.empty:
+        return None
+
+    low = float(values.min())
+    high = float(values.max())
+    if low == high:
+        padding = abs(high) * 0.05 if high else 1
+    else:
+        padding = (high - low) * 0.08
+    return [max(0, low - padding), high + padding]
+
+
+def get_loss_amount_breakdown(analytics, year=None):
+    df = analytics._filter_by_year(analytics.data.copy(), year)
+    if "brewing_loss" not in df.columns:
+        df["brewing_loss"] = df["production_loss"] * 0.35
+    if "packaging_loss" not in df.columns:
+        df["packaging_loss"] = df["production_loss"] * 0.25
+
+    loss_data = df.groupby("beer_style")[["brewing_loss", "production_loss", "packaging_loss"]].sum()
+    loss_data = loss_data.rename(columns={
+        "brewing_loss": "Brewing Loss",
+        "production_loss": "Fermentation Loss",
+        "packaging_loss": "Packaging Loss"
+    })
+    return loss_data.reset_index().melt(
+        id_vars="beer_style",
+        var_name="loss_stage",
+        value_name="loss_amount"
+    ).round(2)
+
+
+def stacked_loss_axis_range(data):
+    totals = data.groupby("beer_style")["loss_amount"].sum()
+    high = float(totals.max()) if not totals.empty else 0
+    return [0, high * 1.08 if high else 1]
+
+
+def sku_loss_axis_range(values, base=30000):
+    values = pd.to_numeric(values, errors="coerce").dropna()
+    if values.empty:
+        return [base, base + 1]
+    high = float(values.max())
+    return [base, high * 1.05 if high > base else base + 1]
+
+if (
+    "analytics" not in st.session_state
+    or not hasattr(st.session_state.analytics, "get_production_by_year")
+    or not hasattr(st.session_state.analytics, "get_loss_breakdown_by_style")
+    or not hasattr(st.session_state.analytics, "get_total_loss_by_sku")
+    or not hasattr(st.session_state.analytics, "forecast_total_revenue_by_style")
+):
+    st.session_state.analytics = BreweryAnalytics()
+
+analytics = st.session_state.analytics
+
+if analytics.data is None:
+    with st.spinner("Loading brewery_50k_all_dates.csv..."):
+        load_message = analytics.load_txt_data(local_file="brewery_50k_all_dates.csv")
+
+
+if analytics.data is None:
+    st.error(load_message)
+else:
+    tab1, tab2, tab3 = st.tabs(["Descriptive", "Predictive", "Strategic Recommendation"])
+
+    # ===================== tab1 =====================
+    with tab1:
+        st.header("Descriptive Analytics")
+
+        # filter year
+        year_values = safe_column(analytics.data, "year")
+        years = sorted(int(y) for y in year_values.dropna().unique() if int(y) <= 2023)
+        selected_years = st.multiselect("Filter by Year", years, default=years)
+        filter_year = selected_years if selected_years else years
+
+        # KPI
+        st.subheader("Key Performance Indicators")
+        kpis = analytics.get_kpis(filter_year)
+        col1, col2, col3, col4, col5 = st.columns(5)
+        col1.metric("Total Revenue", f"RM {kpis['total_revenue']:,.2f}")
+        col2.metric("Total Production Volume", f"{kpis['total_production']:,.0f} units")
+        col3.metric("Best-Selling Style", kpis['best_selling_style'])
+        col4.metric("Highest Quality", kpis['highest_quality_style'])
+        col5.metric("Avg Production Efficiency", f"{kpis['avg_efficiency']:.2f}%")
+
+        st.divider()
+
+        # table
+        st.subheader("Calculation Tables")
+        t1, t2 = st.tabs(["Production Volume", "Product Performance"])
+
+        with t1:
+            st.write("**Total Production Volume by Year**")
+            st.dataframe(centered_dataframe(analytics.get_production_by_year(filter_year)), use_container_width=True, hide_index=True)
+
+        with t2:
+            st.write("**Product Performance by Beer Style and SKU**")
+            st.dataframe(centered_dataframe(
+                analytics.get_product_performance(filter_year),
+                {"total_revenue": "{:,.2f}", "avg_quality": "{:,.2f}", "avg_efficiency": "{:,.2f}"}
+            ), use_container_width=True, hide_index=True)
+
+        st.divider()
+
+        # chart
+        st.subheader("Visualizations")
+        g1, g2 = st.columns(2)
+
+        with g1:
+            data = analytics.get_sales_by_style(filter_year)
+            fig = px.bar(data, x="beer_style", y="total_revenue", color="total_revenue",
+                         color_continuous_scale=["#deebf7", "#9ecae1", "#3182bd", "#08519c"],
+                         title="Total Sales Revenue Rank by Beer Style", text_auto=".2s")
+            fig.update_yaxes(range=numeric_axis_range(data["total_revenue"]))
+            st.plotly_chart(fig, use_container_width=True)
+
+        with g2:
+            data = analytics.get_sku_sales_vs_production(filter_year)
+            fig = make_subplots(specs=[[{"secondary_y": True}]])
+            fig.add_trace(
+                go.Bar(x=data["sku"], y=data["revenue"], name="Total Sales Revenue", marker_color="#2b5c8f"),
+                secondary_y=False
+            )
+            fig.add_trace(
+                go.Scatter(x=data["sku"], y=data["volume"], name="Total Production Volume",
+                           mode="lines+markers", line=dict(color="#d95f02", width=3)),
+                secondary_y=True
+            )
+            fig.update_layout(title="SKU Performance: Sales Revenue vs Production Volume", xaxis_title="SKU")
+            fig.update_yaxes(title_text="Total Sales Revenue", range=numeric_axis_range(data["revenue"]), secondary_y=False)
+            fig.update_yaxes(title_text="Total Production Volume", range=numeric_axis_range(data["volume"]), secondary_y=True)
+            st.plotly_chart(fig, use_container_width=True)
+
+        g3, g4 = st.columns(2)
+        with g3:
+            data = get_loss_amount_breakdown(analytics, filter_year)
+            fig = px.bar(data, x="beer_style", y="loss_amount", color="loss_stage",
+                             title="Production Volume Loss Breakdown by Beer Style",
+                             labels={"beer_style": "Beer Style", "loss_amount": "Total Production Loss",
+                                     "loss_stage": "Loss Processing Stage"},
+                             text="loss_amount")
+            fig.update_yaxes(range=stacked_loss_axis_range(data))
+            fig.update_traces(texttemplate="%{text:.2s}", textposition="inside")
+            fig.update_layout(barmode="stack", uniformtext_minsize=8, uniformtext_mode="hide")
+            st.plotly_chart(fig, use_container_width=True)
+
+        with g4:
+            data = analytics.get_total_loss_by_sku(filter_year)
+            fig = px.bar(
+                data,
+                x="sku",
+                y="production_loss",
+                color="production_loss",
+                color_continuous_scale=["#fee5d9", "#fcae91", "#fb6a4a", "#cb181d"],
+                title="Total Production Loss by SKU",
+                labels={"sku": "SKU", "production_loss": "Total Production Loss"},
+                text_auto=".2s"
+            )
+            fig.update_layout(xaxis_title="SKU", yaxis_title="Total Production Loss")
+            fig.update_yaxes(range=sku_loss_axis_range(data["production_loss"]))
+            st.plotly_chart(fig, use_container_width=True)
+
+        st.divider()
+
+        
+        st.subheader("Business Insights")
+        insights = analytics.get_descriptive_insights(filter_year)
+
+        q1, q2 = st.columns(2)
+        q1.info(f"**Highest Revenue Style:** {insights['highest_revenue_style']}")
+        q2.info(f"**Highest Quality Style:** {insights['highest_quality_style']}")
+
+        q3, q4 = st.columns(2)
+        q3.info(f"**Best Performance SKU:** {insights['best_performance_sku']}")
+        q4.info(f"**SKU Needing Improvement:** {insights['improvement_sku']}")
+
+        st.info(f"**Beer Style Performance:** {insights['style_performance_insight']}")
+        st.info(f"**SKU Performance:** {insights['sku_performance_insight']}")
+
+    # ===================== tab 2 =====================
+    with tab2:
+        st.header("Predictive Analytics")
+
+        styles = sorted(safe_column(analytics.data, "beer_style").dropna().unique())
+        selected_predict_styles = st.multiselect("Filter by Beer Style", styles, default=styles, key="predict_styles")
+        selected_predict_styles = selected_predict_styles if selected_predict_styles else styles
+
+        forecast_data = analytics.forecast_total_revenue_by_style()
+        forecast_data = forecast_data[forecast_data["beer_style"].isin(selected_predict_styles)]
+
+        if forecast_data.empty:
+            st.warning("Not enough historical revenue data to generate forecasts.")
+        else:
+            # forecast
+            st.subheader("Part 1: Total Revenue Forecast by Beer Style")
+
+            fig = px.line(
+                forecast_data,
+                x="year",
+                y="value",
+                color="beer_style",
+                line_dash="type",
+                markers=True,
+                custom_data=["beer_style"],
+                title="Total Sales Revenue Forecast by Beer Style (Exponential Smoothing)",
+                labels={"year": "Year", "value": "Total Sales Revenue", "beer_style": "Beer Style", "type": "Type"}
+            )
+            fig.update_xaxes(dtick=1, tickformat="d")
+            fig.update_traces(
+                hovertemplate=(
+                    "Beer Style=%{customdata[0]}<br>"
+                    "Year=%{x}<br>"
+                    "Total Sales Revenue=%{y:,.2f}<extra></extra>"
+                )
+            )
+
+            selected_forecast_style = st.session_state.get("selected_forecast_style")
+            if selected_forecast_style not in selected_predict_styles:
+                selected_forecast_style = None
+                st.session_state.selected_forecast_style = None
+
+            if selected_forecast_style:
+                for trace in fig.data:
+                    trace_style = (
+                        trace.customdata[0][0]
+                        if trace.customdata is not None and len(trace.customdata)
+                        else trace.name.split(",")[0]
+                    )
+                    if trace_style == selected_forecast_style:
+                        trace.line.width = 4
+                        trace.marker.size = 10
+                    else:
+                        trace.opacity = 0.18
+
+            chart_event = st.plotly_chart(
+                fig,
+                use_container_width=True,
+                on_select="rerun",
+                selection_mode="points",
+                key="revenue_forecast_chart"
+            )
+
+            if chart_event and chart_event.selection and chart_event.selection.points:
+                selected_point = chart_event.selection.points[0]
+                selected_customdata = selected_point.get("customdata") or []
+                clicked_style = selected_customdata[0] if selected_customdata else selected_point.get("legendgroup")
+                if clicked_style in selected_predict_styles:
+                    st.session_state.selected_forecast_style = clicked_style
+                    selected_forecast_style = clicked_style
+            
+            st.divider()
+
+            # table forecast
+            summary_title = "Part 2: Revenue Forecast Summary (2024-2028)"
+            table_forecast_data = forecast_data
+            if selected_forecast_style:
+                summary_title += f" - {selected_forecast_style}"
+                table_forecast_data = forecast_data[forecast_data["beer_style"] == selected_forecast_style]
+                if st.button("Show all beer styles", key="clear_forecast_style"):
+                    st.session_state.selected_forecast_style = None
+                    st.rerun()
+
+            st.subheader(summary_title)
+            forecast_summary = analytics.get_total_revenue_forecast_summary(table_forecast_data)
+            forecast_formats = {col: "{:,.2f}" for col in forecast_summary.columns if col != "year"}
+            forecast_formats["year"] = "{:.0f}"
+            st.dataframe(centered_dataframe(forecast_summary, forecast_formats), use_container_width=True, hide_index=True)
+
+            st.divider()
+
+            # recommendation
+            st.subheader("Part 3: Future Recommendations")
+            forecast_only = forecast_data[forecast_data["type"] == "Forecast"]
+            yearly_totals = forecast_only.groupby("year")["value"].sum()
+            style_totals = forecast_only.groupby("beer_style")["value"].sum()
+            top_year = int(yearly_totals.idxmax())
+            top_style = style_totals.idxmax()
+            low_style = style_totals.idxmin()
+
+            r1, r2 = st.columns(2)
+            r1.info(f"**Highest Projected Revenue Year:** {top_year}")
+            r2.info(f"**Top Forecast Beer Style:** {top_style}")
+
+            st.success(
+                f"**Revenue Strategy:** Prioritize production and promotion for {top_style}, which has the strongest projected total revenue from 2024 to 2028. "
+                f"{low_style} needs improvement because it has the weakest projected revenue; review its pricing, promotion plan, SKU range, and production allocation."
+            )
+
+    # ===================== tab 3=====================
+    with tab3:
+        st.header("Strategic Recommendation")
+
+        styles = sorted(safe_column(analytics.data, "beer_style").dropna().unique())
+        selected_styles = st.multiselect("Filter by Beer Style", styles, default=styles, key="strategy_styles")
+        selected_styles = selected_styles if selected_styles else styles
+
+        strategy_forecast = analytics.forecast_total_revenue_by_style(forecast_years=[2024, 2025, 2026, 2027, 2028])
+        strategy_forecast = strategy_forecast[strategy_forecast["beer_style"].isin(selected_styles)]
+
+        def build_growth_table(target_year):
+            pivot = strategy_forecast[strategy_forecast["year"].isin([2023, target_year])].pivot_table(
+                index="beer_style",
+                columns="year",
+                values="value",
+                aggfunc="sum"
+            )
+            for col in [2023, target_year]:
+                if col not in pivot.columns:
+                    pivot[col] = 0
+            table = pivot[[2023, target_year]].reset_index()
+            table = table.rename(columns={2023: "revenue_2023", target_year: f"forecast_{target_year}"})
+            growth = (table[f"forecast_{target_year}"] - table["revenue_2023"]) / table["revenue_2023"] * 100
+            table["growth_rate_pct"] = growth.where(table["revenue_2023"] != 0, 0).round(2)
+            return table.sort_values("growth_rate_pct", ascending=False)
+
+        # short term
+        st.subheader("Part 1: Short-Term Revenue Growth Strategy")
+        short_table = build_growth_table(2024)
+        short_table_col, short_graph_col = st.columns(2)
+        with short_table_col:
+            st.write("**1-Year Revenue Growth Rate (2024 Forecast vs 2023 Actual)**")
+            st.dataframe(centered_dataframe(short_table, {"revenue_2023": "{:,.2f}", "forecast_2024": "{:,.2f}", "growth_rate_pct": "{:,.2f}"}), use_container_width=True, hide_index=True)
+
+        with short_graph_col:
+            fig = px.bar(
+                short_table,
+                x="beer_style",
+                y="growth_rate_pct",
+                color="growth_rate_pct",
+                color_continuous_scale=[(0, "#b2182b"), (0.5, "#f7f7f7"), (1, "#1a9850")],
+                color_continuous_midpoint=0,
+                title="Short-Term Revenue Growth Rate by Beer Style (2024 Forecast vs 2023 Actual)",
+                labels={"beer_style": "Beer Style", "growth_rate_pct": "Revenue Growth Rate (%)"}
+            )
+            fig.update_layout(coloraxis_colorbar_title="Growth %")
+            st.plotly_chart(fig, use_container_width=True)
+
+        best_short_style = short_table.iloc[0]["beer_style"]
+        lowest_short_style = short_table.iloc[-1]["beer_style"]
+        lowest_short_growth = short_table.iloc[-1]["growth_rate_pct"]
+        st.success(
+            f"**Short-Term Recommendation:** Focus on {best_short_style}, which has the strongest 1-year projected revenue growth from 2023 to 2024. "
+            f"{lowest_short_style} has the lowest 1-year growth rate at {lowest_short_growth:.2f}%, so improve it through targeted promotions, SKU mix review, and tighter production planning."
+        )
+
+        st.divider()
+
+        # long term
+        st.subheader("Part 2: Long-Term Revenue Growth Strategy")
+        long_table = build_growth_table(2028)
+        long_table_col, long_graph_col = st.columns(2)
+        with long_table_col:
+            st.write("**5-Year Revenue Growth Rate (2028 Forecast vs 2023 Actual)**")
+            st.dataframe(centered_dataframe(long_table, {"revenue_2023": "{:,.2f}", "forecast_2028": "{:,.2f}", "growth_rate_pct": "{:,.2f}"}), use_container_width=True, hide_index=True)
+
+        with long_graph_col:
+            fig = px.bar(
+                long_table,
+                x="beer_style",
+                y="growth_rate_pct",
+                color="growth_rate_pct",
+                color_continuous_scale=[(0, "#b2182b"), (0.5, "#f7f7f7"), (1, "#1a9850")],
+                color_continuous_midpoint=0,
+                title="Long-Term Revenue Growth Rate by Beer Style (2028 Forecast vs 2023 Actual)",
+                labels={"beer_style": "Beer Style", "growth_rate_pct": "Revenue Growth Rate (%)"}
+            )
+            fig.update_layout(coloraxis_colorbar_title="Growth %")
+            st.plotly_chart(fig, use_container_width=True)
+
+        best_long_style = long_table.iloc[0]["beer_style"]
+        lowest_long_style = long_table.iloc[-1]["beer_style"]
+        lowest_long_growth = long_table.iloc[-1]["growth_rate_pct"]
+        st.success(
+            f"**Long-Term Recommendation:** Prioritize {best_long_style} for long-term investment because it has the strongest 5-year projected revenue growth from 2023 to 2028. "
+            f"{lowest_long_style} has the lowest 5-year growth rate at {lowest_long_growth:.2f}%, so improve it with product refreshes, quality upgrades, pricing review, and market repositioning."
+        )
+
+        st.divider()
+
+        st.subheader("Part 3: Conclusion")
+        conclusion_insights = analytics.get_descriptive_insights()
+        positive_growth_styles = long_table[long_table["growth_rate_pct"] > 0]["beer_style"].tolist()
+        positive_growth_text = ", ".join(positive_growth_styles) if positive_growth_styles else "no beer styles"
+        st.info(
+            f"**Growth Focus:** Produce more for beer styles with positive long-term growth rates ({positive_growth_text}). "
+            f"Focus on the best performance SKU, which currently {conclusion_insights['best_performance_sku']} is the best performance benchmark."
+        )
+        st.info(
+            f"**Loss Control:** Reduce or review production for weak-growth styles such as {lowest_long_style} and lower-performing SKUs such as {conclusion_insights['improvement_sku']}. "
+            f"Research demand, adjust batch size, improve process control, and monitor packaging or fermentation loss before increasing production."
+        )
